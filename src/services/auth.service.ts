@@ -2,49 +2,59 @@ import { supabase } from './supabase';
 import { UserProfile, WalletState } from '../types';
 
 export const authService = {
-  /**
-   * Synchronizes the Telegram user data with the Supabase database.
-   * If the user doesn't exist, it handles server-side sign-up and provisions a wallet.
-   */
-  async syncUserSession(tgUser: { id: number; username?: string; first_name: string; last_name?: string }): Promise<{ profile: UserProfile; wallet: WalletState } | null> {
+  async syncUserSession(
+    tgUser: { id: number; username?: string; first_name: string; last_name?: string },
+    startParam?: string
+  ): Promise<{ profile: UserProfile; wallet: WalletState } | null> {
     const telegramId = tgUser.id.toString();
-    
-    // 1. Check if the user profile already exists
+
+    // Fetch existing user parameters from table structures
     let { data: user, error: userError } = await supabase
       .from('users')
       .select('*')
       .eq('telegram_id', telegramId)
       .single();
 
-    if (userError && userError.code !== 'PGRST116') { // PGRST116 means row not found
-      console.error('Error fetching user profile:', userError.message);
+    if (userError && userError.code !== 'PGRST116') {
+      console.error('Error fetching user:', userError.message);
       return null;
     }
 
-    // 2. If user doesn't exist, register them (Sign up flow)
+    // Handshake signup flow if the account record does not exist
     if (!user) {
-      const generatedReferralCode = `NE_${telegramId}_${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
-      
+      const uniqueReferralCode = `NE_${telegramId}_${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+      let validatedReferrer: string | null = null;
+
+      if (startParam && startParam.trim() !== '') {
+        const { data: referrerCheck } = await supabase
+          .from('users')
+          .select('telegram_id')
+          .eq('referral_code', startParam.trim())
+          .single();
+        if (referrerCheck) validatedReferrer = referrerCheck.telegram_id;
+      }
+
       const { data: newUser, error: createError } = await supabase
         .from('users')
         .insert([{
           telegram_id: telegramId,
           username: tgUser.username || `user_${telegramId}`,
           first_name: tgUser.first_name,
-          referral_code: generatedReferralCode,
+          referral_code: uniqueReferralCode,
+          referred_by: validatedReferrer,
           role: 'user'
         }])
         .select()
         .single();
 
       if (createError) {
-        console.error('Failed to provision user profile:', createError.message);
+        console.error('Profile creation transaction failed:', createError.message);
         return null;
       }
       user = newUser;
     }
 
-    // 3. Fetch or provision the linked wallet ledger asset
+    // Fetch or provision linked wallet balance asset row
     let { data: wallet, error: walletError } = await supabase
       .from('wallets')
       .select('*')
@@ -54,18 +64,17 @@ export const authService = {
     if (!wallet) {
       const { data: newWallet, error: createWalletError } = await supabase
         .from('wallets')
-        .insert([{ user_id: telegramId, balance_ngn: 0.00, balance_points: 0 }])
+        .insert([{ user_id: telegramId, balance_ngn: 0.00, balance_points: 0, total_withdrawn: 0.00 }])
         .select()
         .single();
 
       if (createWalletError) {
-        console.error('Failed to provision wallet ledger:', createWalletError.message);
+        console.error('Wallet provisioning error transaction:', createWalletError.message);
         return null;
       }
       wallet = newWallet;
     }
 
-    // 4. Map DB schema keys to our strict Frontend Domain types
     return {
       profile: {
         telegramId: user.telegram_id,
